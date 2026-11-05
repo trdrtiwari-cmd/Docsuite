@@ -141,6 +141,8 @@ pre.code.wrap{white-space:pre-wrap;word-break:break-word}
 @media (min-width:600px){.sheet-bg{align-items:center}.sheet-card{border-radius:18px}}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}
 .kv dt{color:var(--muted)} .kv dd{margin:0;word-break:break-word}
+.sopt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:12px 14px;margin-top:8px;font-weight:600}
+.sopt small{display:block;font-weight:400;color:var(--muted)}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 16px;border-radius:10px;font-size:14px;z-index:60;box-shadow:var(--shadow)}
 </style>
 </head>
@@ -151,6 +153,7 @@ pre.code.wrap{white-space:pre-wrap;word-break:break-word}
   <div class="brand" id="brand"><div class="logo">D</div><span>DocSuite</span></div>
   <div class="title hidden" id="docTitle"></div>
   <div style="flex:1" id="spacer"></div>
+  <button class="ibtn hidden" id="shareBtn" aria-label="Share"><svg viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg></button>
   <button class="ibtn hidden" id="infoBtn" aria-label="File info"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg></button>
   <button class="pbtn" id="openBtn"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span>Open</span></button>
   <input type="file" id="fileInput" class="hidden">
@@ -299,6 +302,7 @@ document.addEventListener("drop", ev => { const f = ev.dataTransfer?.files?.[0];
 
 $("#backBtn").onclick = goBack;
 $("#infoBtn").onclick = showInfo;
+$("#shareBtn").onclick = showShare;
 window.addEventListener("keydown", e => { if (e.key === "Escape") { const s = $(".sheet-bg"); if (s) s.remove(); } });
 
 function teardown(){ cleanup.forEach(fn => { try{fn()}catch{} }); cleanup = []; tools.innerHTML = ""; tools.classList.add("hidden"); view.innerHTML = ""; }
@@ -310,7 +314,7 @@ function goBack(){
 function showHome(){
   teardown(); stack = []; current = null;
   view.classList.add("hidden"); home.classList.remove("hidden");
-  $("#backBtn").classList.add("hidden"); $("#infoBtn").classList.add("hidden");
+  $("#backBtn").classList.add("hidden"); $("#infoBtn").classList.add("hidden"); $("#shareBtn").classList.add("hidden");
   $("#docTitle").classList.add("hidden"); $("#brand").classList.remove("hidden"); $("#spacer").classList.remove("hidden");
   renderRecent(); window.scrollTo(0,0);
 }
@@ -327,6 +331,7 @@ async function openFile(file, fresh, extra){
   }
   home.classList.add("hidden"); view.classList.remove("hidden");
   $("#backBtn").classList.remove("hidden"); $("#infoBtn").classList.remove("hidden");
+  $("#shareBtn").classList.toggle("hidden", !canShareFiles());
   $("#brand").classList.add("hidden"); $("#spacer").classList.add("hidden");
   const t = $("#docTitle"); t.textContent = file.name; t.classList.remove("hidden");
   window.scrollTo(0,0);
@@ -345,6 +350,51 @@ async function openFile(file, fresh, extra){
 function toolbar(...items){ tools.innerHTML=""; tools.append(...items.filter(Boolean)); tools.classList.remove("hidden"); }
 const tbtn = (label, onclick, on) => h("button",{class:"tbtn"+(on?" on":""), onclick}, label);
 const sep = () => h("div",{class:"tsep"});
+
+/* ---------- sharing ---------- */
+const MIME = {pdf:"application/pdf", docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xls:"application/vnd.ms-excel", csv:"text/csv",
+  pptx:"application/vnd.openxmlformats-officedocument.presentationml.presentation", png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg",
+  gif:"image/gif", webp:"image/webp", svg:"image/svg+xml", txt:"text/plain", md:"text/markdown", json:"application/json",
+  html:"text/html", zip:"application/zip", mp3:"audio/mpeg", mp4:"video/mp4"};
+const mimeOf = (name, t) => t || MIME[ext(name)] || "application/octet-stream";
+const canShareFiles = () => !!window.DocSuiteAndroid || !!(navigator.canShare && navigator.share);
+async function shareBlob(blob, name){
+  const type = mimeOf(name, blob.type);
+  if (window.DocSuiteAndroid){
+    // Android app: stream the bytes to the native side in base64 chunks, then open the share menu.
+    toast("Preparing to share…");
+    await new Promise(r => setTimeout(r, 30));
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    DocSuiteAndroid.begin(name);
+    const CH = 3 * 256 * 1024;
+    for (let i = 0; i < buf.length; i += CH){
+      const sub = buf.subarray(i, i + CH); let bin = "";
+      for (let j = 0; j < sub.length; j += 0x8000) bin += String.fromCharCode.apply(null, sub.subarray(j, j + 0x8000));
+      DocSuiteAndroid.chunk(btoa(bin));
+    }
+    DocSuiteAndroid.finish(type);
+    return;
+  }
+  const f = new File([blob], name, {type});
+  try {
+    if (navigator.canShare?.({files:[f]})) await navigator.share({files:[f], title:name});
+    else toast("Sharing isn't available in this browser");
+  } catch (e){ if (e?.name !== "AbortError") toast("Sharing isn't available here"); }
+}
+function showShare(){
+  if (!current) return;
+  const f = current.file;
+  const opts = [h("button",{class:"sopt", onclick:()=>{ bg.remove(); shareBlob(f, f.name); }},
+    h("span",{style:"font-size:22px"},"📄"), h("span",{}, "Share file", h("small",{}, `${f.name} · ${fmtSize(f.size)}`)))];
+  if (current.sharePage) opts.push(h("button",{class:"sopt", onclick:async ()=>{ bg.remove();
+      try { const {blob, name} = await current.sharePage(); shareBlob(blob, name); } catch { toast("Couldn't create the page image"); } }},
+    h("span",{style:"font-size:22px"},"🖼️"), h("span",{}, "Share current page as image", h("small",{}, "PNG of the page you're viewing"))));
+  if (opts.length === 1){ shareBlob(f, f.name); return; }
+  const bg = h("div",{class:"sheet-bg", onclick:e=>{ if(e.target===bg) bg.remove(); }},
+    h("div",{class:"sheet-card"}, h("h3",{style:"margin:0 0 6px"},"Share"), ...opts));
+  document.body.append(bg);
+}
 
 function showInfo(){
   if (!current) return;
@@ -523,6 +573,18 @@ VIEWERS.pdf = async (file) => {
       window.scrollBy(0, r.top + an.fy*r.height - g.cy);
     }
   }
+  current.sharePage = async () => {
+    const n = parseInt(pageLbl.textContent) || 1;
+    const page = await pdf.getPage(n);
+    const v1 = page.getViewport({scale:1});
+    const sc = Math.min(3, 2400 / Math.max(v1.width, v1.height) * 1.5);
+    const vp = page.getViewport({scale: sc});
+    const c = document.createElement("canvas"); c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+    const ctx = c.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    await page.render({canvasContext: ctx, viewport: vp}).promise;
+    const blob = await new Promise(r => c.toBlob(r, "image/png"));
+    return {blob, name: current.file.name.replace(/\.pdf$/i, "") + `-page-${n}.png`};
+  };
   current.pinch = {
     start(g){ if (mode !== "pages") return; const r = wrap.getBoundingClientRect();
       wrap.style.transformOrigin = `${g.cx - r.left}px ${g.cy - r.top}px`; },

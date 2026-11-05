@@ -6,6 +6,9 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
+import android.content.ClipData;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -19,6 +22,7 @@ import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
 import androidx.webkit.WebViewAssetLoader;
 
 import org.json.JSONObject;
@@ -27,6 +31,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.IOException;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -139,6 +144,7 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        web.addJavascriptInterface(new ShareBridge(), "DocSuiteAndroid");
         web.loadUrl(START_URL);
         if (savedInstanceState == null) handleIntent(getIntent());
     }
@@ -190,6 +196,76 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> Toast.makeText(this, "Couldn't open this file", Toast.LENGTH_LONG).show());
             }
         }).start();
+    }
+
+    /** Receives a file from the page in base64 chunks and opens the Android share menu. */
+    private class ShareBridge {
+        private File outFile;
+        private OutputStream out;
+
+        @JavascriptInterface
+        public void begin(String name) {
+            try {
+                closeQuietly();
+                File dir = new File(getCacheDir(), "out");
+                //noinspection ResultOfMethodCallIgnored
+                dir.mkdirs();
+                File[] old = dir.listFiles();
+                if (old != null) for (File f : old) //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                String safe = (name == null || name.trim().isEmpty()) ? "document" : name.replaceAll("[\\\\/:*?\"<>|]", "_");
+                outFile = new File(dir, safe);
+                out = new FileOutputStream(outFile);
+            } catch (IOException e) {
+                outFile = null;
+                toast("Couldn't prepare file to share");
+            }
+        }
+
+        @JavascriptInterface
+        public void chunk(String b64) {
+            if (out == null) return;
+            try {
+                out.write(Base64.decode(b64, Base64.DEFAULT));
+            } catch (Exception e) {
+                closeQuietly();
+                outFile = null;
+                toast("Couldn't prepare file to share");
+            }
+        }
+
+        @JavascriptInterface
+        public void finish(String mime) {
+            if (out == null || outFile == null) return;
+            closeQuietly();
+            final File f = outFile;
+            final String type = (mime == null || mime.isEmpty()) ? "application/octet-stream" : mime;
+            runOnUiThread(() -> {
+                try {
+                    Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".files", f);
+                    Intent send = new Intent(Intent.ACTION_SEND);
+                    send.setType(type);
+                    send.putExtra(Intent.EXTRA_STREAM, uri);
+                    send.putExtra(Intent.EXTRA_SUBJECT, f.getName());
+                    send.setClipData(ClipData.newRawUri(f.getName(), uri));
+                    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(Intent.createChooser(send, "Share " + f.getName()));
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "Couldn't share this file", Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        private void closeQuietly() {
+            if (out != null) {
+                try { out.close(); } catch (IOException ignored) { }
+                out = null;
+            }
+        }
+
+        private void toast(String msg) {
+            runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show());
+        }
     }
 
     private String displayName(Uri uri) {
