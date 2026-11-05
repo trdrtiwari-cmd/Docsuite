@@ -38,7 +38,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 .tbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .tsep{width:1px;height:22px;background:var(--line);flex:none}
 .tlabel{font-size:13px;color:var(--muted);white-space:nowrap;flex:none;font-variant-numeric:tabular-nums}
-.tinput{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:9px;padding:6px 10px;font:inherit;font-size:13px;min-width:0}
+.tinput{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:9px;padding:6px 10px;font:inherit;font-size:13px;min-width:0;flex:none}
 
 /* Home */
 .home{max-width:760px;margin:0 auto;padding:20px 16px 60px}
@@ -77,6 +77,10 @@ button{font:inherit;color:inherit;cursor:pointer}
 .reader{max-width:720px;margin:0 auto;padding:16px 18px 60px;background:var(--panel);min-height:100%}
 .reader h4{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:28px 0 8px;border-top:1px solid var(--line);padding-top:12px}
 .reader p{white-space:pre-wrap;margin:0 0 10px;word-wrap:break-word}
+.reader .rline{white-space:pre;margin:0 0 4px;font-variant-numeric:tabular-nums;width:max-content;min-width:100%}
+.reader{overflow-x:auto}
+.phl{position:absolute;background:rgba(250,204,21,.45);mix-blend-mode:multiply;border-radius:2px;pointer-events:none}
+.phl.cur{background:rgba(249,115,22,.55);outline:2px solid #f97316;outline-offset:1px}
 mark{background:#fde047;color:#111;border-radius:2px}
 
 /* Sheets */
@@ -406,7 +410,7 @@ VIEWERS.pdf = async (file) => {
   try { const md = await pdf.getMetadata(); const i = md.info||{};
     Object.assign(current.info, {"Title":i.Title, "Author":i.Author, "Creator":i.Creator, "Producer":i.Producer, "PDF version":i.PDFFormatVersion}); } catch {}
 
-  let zoom = 1, mode = "pages", textCache = null;
+  let zoom = 1, mode = "pages";
   const wrap = h("div",{class:"pdfwrap"});
   const pageLbl = h("span",{class:"tlabel"}, `1 / ${pdf.numPages}`);
   const zoomLbl = h("span",{class:"tlabel"}, "100%");
@@ -430,6 +434,8 @@ VIEWERS.pdf = async (file) => {
       pages[i] = {el:d, done:false, task:null, W};
       wrap.append(d); observer.observe(d); visObserver.observe(d);
     }
+    matches.forEach(m => m.el = null);
+    new Set(matches.map(m => m.page)).forEach(drawPageHl);
   }
   async function renderPage(n){
     const p = pages[n]; if (!p || p.done) return; p.done = true;
@@ -450,44 +456,143 @@ VIEWERS.pdf = async (file) => {
     pages.forEach(p => p?.task?.cancel?.());
     layout(); pages[cur]?.el.scrollIntoView({block:"start"});
   }
-  async function getText(){
-    if (textCache) return textCache;
-    textCache = [];
-    for (let i = 1; i <= pdf.numPages; i++){
-      const tc = await (await pdf.getPage(i)).getTextContent();
-      let s = ""; for (const it of tc.items){ s += it.str; if (it.hasEOL) s += "\n"; else if (it.str && !it.str.endsWith(" ")) s += " "; }
-      textCache.push(s.replace(/[ \t]+\n/g,"\n").trim());
+
+  /* text positions per page (used by search and reader mode) */
+  const pageData = [];
+  async function getPageData(n){
+    if (pageData[n]) return pageData[n];
+    const page = await pdf.getPage(n);
+    const vp = page.getViewport({scale:1});
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      if (!it.str || !it.str.trim()) continue;
+      const t = it.transform;
+      items.push({str: it.str, x: t[4], y: t[5], w: it.width, h: Math.hypot(t[2], t[3]) || it.height || 10});
     }
-    return textCache;
+    return pageData[n] = {vp, items};
   }
+
+  /* search: highlight matches on the real pages */
+  let matches = [], mIdx = -1, searchToken = 0, searching = false;
+  function drawPageHl(n){
+    const p = pages[n]; if (!p) return;
+    p.el.querySelectorAll(".phl").forEach(x => x.remove());
+    matches.forEach((m, i) => {
+      if (m.page !== n) return;
+      const d = h("div",{class:"phl" + (i === mIdx ? " cur" : "")});
+      Object.assign(d.style, {left:m.l+"%", top:m.t+"%", width:m.w+"%", height:m.h+"%"});
+      m.el = d; p.el.append(d);
+    });
+  }
+  function updateLbl(){
+    sLbl.textContent = matches.length ? `${mIdx+1} / ${matches.length}${searching ? "+" : ""}` : (searching ? "Searching…" : (sInp.value.trim() ? "No matches" : ""));
+  }
+  function go(i){
+    if (!matches.length) return;
+    matches[mIdx]?.el?.classList.remove("cur");
+    mIdx = (i + matches.length) % matches.length;
+    const m = matches[mIdx];
+    if (!m.el) drawPageHl(m.page);
+    m.el.classList.add("cur");
+    m.el.scrollIntoView({block:"center", inline:"center", behavior:"smooth"});
+    updateLbl();
+  }
+  async function runSearch(q){
+    const token = ++searchToken;
+    matches.forEach(m => m.el?.remove());
+    matches = []; mIdx = -1;
+    if (!q){ searching = false; updateLbl(); return; }
+    searching = true; updateLbl();
+    const ql = q.toLowerCase();
+    for (let n = 1; n <= pdf.numPages; n++){
+      const {vp, items} = await getPageData(n);
+      if (token !== searchToken) return;
+      const before = matches.length;
+      for (const it of items){
+        const s = it.str.toLowerCase();
+        const cw = it.w / it.str.length;
+        for (let i = s.indexOf(ql); i >= 0; i = s.indexOf(ql, i + ql.length)){
+          const x0 = it.x + cw*i, x1 = x0 + cw*ql.length;
+          const T = vp.transform, P = (x, y) => [T[0]*x + T[2]*y + T[4], T[1]*x + T[3]*y + T[5]];
+          const a = P(x0, it.y - it.h*0.22), b = P(x1, it.y + it.h*0.88), r = [a[0], a[1], b[0], b[1]];
+          matches.push({page:n,
+            l: Math.min(r[0],r[2]) / vp.width * 100, t: Math.min(r[1],r[3]) / vp.height * 100,
+            w: Math.abs(r[2]-r[0]) / vp.width * 100, h: Math.abs(r[3]-r[1]) / vp.height * 100});
+        }
+      }
+      if (matches.length > before){
+        drawPageHl(n);
+        if (mIdx < 0) go(0);
+      }
+      if (n % 10 === 0) updateLbl();
+    }
+    searching = false; updateLbl();
+  }
+
+  /* reader mode: rebuild text lines from positions so table rows stay on one line */
   let readerEl = null;
   async function setMode(m){
     mode = m; modeBtns.forEach(b => b.classList.toggle("on", b.dataset.m === m));
     zoomGroup.forEach(x => x.classList.toggle("hidden", m !== "pages"));
-    if (m === "pages"){ readerEl?.remove(); readerEl = null; wrap.classList.remove("hidden"); return; }
+    if (m === "pages"){ readerEl?.remove(); readerEl = null; wrap.classList.remove("hidden"); runSearch(sInp.value.trim()); return; }
     wrap.classList.add("hidden");
     readerEl = h("div",{class:"reader"}, h("div",{class:"center"}, h("div",{}, h("div",{class:"spin"}), "Extracting text…")));
     view.append(readerEl);
-    const txt = await getText();
-    if (mode !== "text") return;
+    const frag = document.createDocumentFragment();
+    let any = false;
+    for (let n = 1; n <= pdf.numPages; n++){
+      const {items} = await getPageData(n);
+      if (mode !== "text") return;
+      frag.append(h("h4",{},`Page ${n}`));
+      const sorted = [...items].sort((a,b) => (b.y - a.y) || (a.x - b.x));
+      const lines = [];
+      for (const it of sorted){
+        const ln = lines[lines.length-1];
+        if (ln && Math.abs(ln.y - it.y) < Math.max(2, it.h*0.5)) ln.items.push(it); else lines.push({y: it.y, items:[it]});
+      }
+      for (const ln of lines){
+        ln.items.sort((a,b) => a.x - b.x);
+        let s = "", end = null;
+        for (const it of ln.items){
+          if (end !== null){ const gap = it.x - end; s += gap > it.h*1.2 ? "  " : (gap > it.h*0.15 && !s.endsWith(" ") ? " " : ""); }
+          s += it.str; end = it.x + it.w;
+        }
+        frag.append(h("div",{class:"rline"}, s)); any = true;
+      }
+    }
     readerEl.innerHTML = "";
-    if (!txt.join("").trim()) readerEl.append(h("p",{style:"color:var(--muted)"}, "No selectable text in this PDF (it may be a scanned image)."));
-    else txt.forEach((t,i) => { readerEl.append(h("h4",{},`Page ${i+1}`)); t.split(/\n{2,}/).forEach(par => readerEl.append(h("p",{}, par))); });
+    if (!any) readerEl.append(h("p",{style:"color:var(--muted)"}, "No selectable text in this PDF (it may be a scanned image)."));
+    else readerEl.append(frag);
+    if (sInp.value.trim()) highlightReader();
   }
+  function highlightReader(){
+    if (!readerEl) return;
+    const n = highlight(readerEl, sInp.value.trim());
+    sLbl.textContent = sInp.value.trim() ? (n ? n + " found" : "No matches") : "";
+  }
+
   const modeBtns = [tbtn("Pages", ()=>setMode("pages"), true), tbtn("Reader", ()=>setMode("text"))];
   modeBtns[0].dataset.m = "pages"; modeBtns[1].dataset.m = "text";
   const goInp = h("input",{class:"tinput", type:"number", min:1, max:pdf.numPages, placeholder:"Go to", style:"width:76px"});
   goInp.addEventListener("change", () => { const n = +goInp.value; if (pages[n]) { if (mode!=="pages") setMode("pages"); pages[n].el.scrollIntoView({block:"start"}); } goInp.value=""; });
   const zoomGroup = [tbtn("−", ()=>setZoom(zoom/1.25)), zoomLbl, tbtn("+", ()=>setZoom(zoom*1.25)), tbtn("Fit", ()=>setZoom(1))];
-  const [sInp, sLbl] = searchBox(() => readerEl);
-  sInp.addEventListener("focus", () => { if (mode !== "text") setMode("text"); });
-  toolbar(...modeBtns, sep(), pageLbl, goInp, sep(), ...zoomGroup, sep(), sInp, sLbl);
+
+  const sInp = h("input",{class:"tinput", type:"search", placeholder:"Find in PDF", enterkeyhint:"search", style:"width:150px"});
+  const sLbl = h("span",{class:"tlabel"});
+  let st;
+  sInp.addEventListener("input", () => { clearTimeout(st); st = setTimeout(() => { mode === "pages" ? runSearch(sInp.value.trim()) : highlightReader(); }, 350); });
+  sInp.addEventListener("keydown", e => { if (e.key === "Enter"){ e.preventDefault(); if (mode === "pages") go(mIdx + 1); sInp.blur(); } });
+  const prevBtn = tbtn("▲", () => go(mIdx - 1));
+  const nextBtn = tbtn("▼", () => go(mIdx + 1));
+  prevBtn.setAttribute("aria-label","Previous match"); nextBtn.setAttribute("aria-label","Next match");
+  toolbar(sInp, prevBtn, nextBtn, sLbl, sep(), ...modeBtns, sep(), pageLbl, goInp, sep(), ...zoomGroup);
 
   view.innerHTML = ""; view.append(wrap); layout();
   let rt; const onResize = () => { clearTimeout(rt); rt = setTimeout(() => { if (mode==="pages") setZoom(zoom); }, 300); };
   let lastW = window.innerWidth;
   const rs = () => { if (Math.abs(window.innerWidth - lastW) > 40){ lastW = window.innerWidth; onResize(); } };
-  window.addEventListener("resize", rs); cleanup.push(() => { window.removeEventListener("resize", rs); observer?.disconnect(); visObserver?.disconnect(); });
+  window.addEventListener("resize", rs); cleanup.push(() => { searchToken++; window.removeEventListener("resize", rs); observer?.disconnect(); visObserver?.disconnect(); });
 };
 
 /* Spreadsheets */
