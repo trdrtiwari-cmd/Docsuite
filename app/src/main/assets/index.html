@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="theme-color" content="#0f172a">
 <title>DocSuite – Universal Document Viewer</title>
 <style>
@@ -15,7 +15,7 @@
   :root{--bg:#0b0f17; --panel:#141a24; --ink:#e5e7eb; --muted:#9ca3af; --line:#263042; --chip:#1e2738; --hover:#1b2230; --shadow:0 1px 3px rgba(0,0,0,.4);}
 }
 *{box-sizing:border-box}
-html,body{margin:0;height:100%}
+html,body{margin:0;min-height:100%}
 body{font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;background:var(--bg);color:var(--ink);-webkit-tap-highlight-color:transparent}
 button{font:inherit;color:inherit;cursor:pointer}
 .hidden{display:none!important}
@@ -62,7 +62,8 @@ button{font:inherit;color:inherit;cursor:pointer}
 .note{font-size:12px;color:var(--muted);margin-top:8px}
 
 /* Viewer */
-#view{min-height:calc(100vh - 110px)}
+#view{min-height:calc(100vh - 110px);touch-action:pan-x pan-y}
+.bar,.tools{touch-action:pan-x}
 .center{display:grid;place-items:center;min-height:50vh;color:var(--muted);text-align:center;padding:30px}
 .spin{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp 0.8s linear infinite;margin:0 auto 12px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -125,9 +126,8 @@ pre.code.wrap{white-space:pre-wrap;word-break:break-word}
 .ln{display:inline-block;width:3.2em;color:var(--muted);user-select:none;text-align:right;margin-right:1em;opacity:.6}
 
 /* Image / media */
-.imgwrap{display:grid;place-items:center;min-height:calc(100vh - 110px);padding:14px;overflow:auto;background:repeating-conic-gradient(var(--hover) 0 25%,transparent 0 50%) 0 0/20px 20px}
-.imgwrap img{max-width:100%;transition:transform .2s;box-shadow:var(--shadow)}
-.imgwrap.full img{max-width:none}
+.imgwrap{display:flex;min-height:calc(100vh - 110px);padding:14px;overflow:auto;background:repeating-conic-gradient(var(--hover) 0 25%,transparent 0 50%) 0 0/20px 20px}
+.imgwrap img{margin:auto;max-width:none;flex:none;transition:transform .2s;box-shadow:var(--shadow)}
 .media{display:grid;place-items:center;padding:20px;min-height:50vh}
 .media video{max-width:100%;max-height:75vh;border-radius:10px;background:#000}
 .media audio{width:min(520px,100%)}
@@ -389,6 +389,50 @@ function searchBox(getRoot, placeholder="Find in document"){
   return [inp, lbl];
 }
 
+/* ---------- pinch zoom (zooms the document only, never the app) ---------- */
+// A viewer sets current.pinch = {start(pz), move(ratio, pz), end(ratio, pz)}.
+let pz = null;
+const tdist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+view.addEventListener("touchstart", e => {
+  if (e.touches.length !== 2 || !current?.pinch) return;
+  const [a, b] = e.touches;
+  pz = {d: tdist(a, b) || 1, cx: (a.clientX + b.clientX)/2, cy: (a.clientY + b.clientY)/2, r: 1};
+  current.pinch.start?.(pz);
+  e.preventDefault();
+}, {passive:false});
+view.addEventListener("touchmove", e => {
+  if (!pz || e.touches.length !== 2) return;
+  pz.r = tdist(e.touches[0], e.touches[1]) / pz.d;
+  current?.pinch?.move?.(pz.r, pz);
+  e.preventDefault();
+}, {passive:false});
+const pinchEnd = e => {
+  if (!pz || e.touches.length >= 2) return;
+  const g = pz; pz = null;
+  current?.pinch?.end?.(g.r, g);
+};
+view.addEventListener("touchend", pinchEnd);
+view.addEventListener("touchcancel", pinchEnd);
+// Ctrl + mouse wheel / trackpad pinch on desktop
+view.addEventListener("wheel", e => {
+  if (!e.ctrlKey || !current?.pinch) return;
+  e.preventDefault();
+  const g = {cx: e.clientX, cy: e.clientY};
+  const r = Math.exp(-e.deltaY / 300);
+  current.pinch.start?.(g); current.pinch.end?.(r, g);
+}, {passive:false});
+// Live preview by CSS transform, then commit a real re-layout on release.
+function livePinch(getEl, commit){
+  let el = null;
+  return {
+    start(g){ el = typeof getEl === "function" ? getEl() : getEl; if (!el) return;
+      const r = el.getBoundingClientRect(); el.style.transformOrigin = `${g.cx - r.left}px ${g.cy - r.top}px`; },
+    move(r){ if (el) el.style.transform = `scale(${r})`; },
+    end(r, g){ if (el) el.style.transform = ""; commit(r, g); }
+  };
+}
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
 /* ---------- viewers ---------- */
 const VIEWERS = {};
 
@@ -416,20 +460,25 @@ VIEWERS.pdf = async (file) => {
   const zoomLbl = h("span",{class:"tlabel"}, "100%");
   const first = await pdf.getPage(1);
   const baseVp = first.getViewport({scale:1});
-  const pages = [];
+  const pages = [], ratios = [];
   let observer, visObserver;
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const MINZ = 0.5, MAXZ = 6;
 
   function layout(){
     wrap.innerHTML = "";
     observer?.disconnect(); visObserver?.disconnect();
     const W = Math.max(200, (view.clientWidth || window.innerWidth) - 16) * zoom;
-    observer = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) renderPage(+e.target.dataset.n); }), {rootMargin:"800px 0px"});
+    observer = new IntersectionObserver(es => es.forEach(e => {
+      const n = +e.target.dataset.n;
+      if (e.isIntersecting) renderPage(n);
+      else { const p = pages[n]; if (p?.done){ p.task?.cancel?.(); p.el.querySelector("canvas")?.remove(); p.done = false; } } // free memory
+    }), {rootMargin:"1200px 1200px"});
     visObserver = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) pageLbl.textContent = `${e.target.dataset.n} / ${pdf.numPages}`; }), {threshold:0.5});
     for (let i = 1; i <= pdf.numPages; i++){
       const d = h("div",{class:"ppage", "data-n":i});
       d.style.width = W+"px";
-      d.style.aspectRatio = `${baseVp.width} / ${baseVp.height}`;
+      d.style.aspectRatio = ratios[i] || `${baseVp.width} / ${baseVp.height}`;
       d.append(h("span",{class:"pn"}, i));
       pages[i] = {el:d, done:false, task:null, W};
       wrap.append(d); observer.observe(d); visObserver.observe(d);
@@ -441,21 +490,45 @@ VIEWERS.pdf = async (file) => {
     const p = pages[n]; if (!p || p.done) return; p.done = true;
     const page = await pdf.getPage(n);
     const vp1 = page.getViewport({scale:1});
-    p.el.style.aspectRatio = `${vp1.width} / ${vp1.height}`;
+    ratios[n] = `${vp1.width} / ${vp1.height}`;
+    p.el.style.aspectRatio = ratios[n];
     const vp = page.getViewport({scale: p.W / vp1.width});
-    const c = h("canvas"); c.width = Math.floor(vp.width*dpr); c.height = Math.floor(vp.height*dpr);
+    // keep canvases within mobile GPU limits at high zoom
+    const k = Math.min(dpr, 4096 / vp.width, 4096 / vp.height, Math.sqrt(16e6 / (vp.width * vp.height)));
+    const c = h("canvas"); c.width = Math.floor(vp.width*k); c.height = Math.floor(vp.height*k);
     try {
-      p.task = page.render({canvasContext:c.getContext("2d"), viewport:vp, transform: dpr !== 1 ? [dpr,0,0,dpr,0,0] : null});
+      p.task = page.render({canvasContext:c.getContext("2d"), viewport:vp, transform: k !== 1 ? [k,0,0,k,0,0] : null});
       await p.task.promise;
+      if (pages[n] !== p || !p.done) return;
+      p.el.querySelector("canvas")?.remove();
       p.el.prepend(c);
     } catch (e){ if (e?.name !== "RenderingCancelledException") console.warn(e); }
   }
-  function setZoom(z){
-    zoom = Math.min(4, Math.max(0.4, z)); zoomLbl.textContent = Math.round(zoom*100)+"%";
-    const cur = parseInt(pageLbl.textContent) || 1;
+  // Zoom keeping the point (cx, cy) on screen fixed (defaults to screen centre).
+  function setZoom(z, g){
+    const nz = clamp(z, MINZ, MAXZ);
+    g = g || {cx: window.innerWidth/2, cy: (window.innerHeight + 110)/2};
+    // find the page under the focal point and the relative position inside it
+    let an = null;
+    for (let i = 1; i < pages.length; i++){
+      const r = pages[i].el.getBoundingClientRect();
+      if (g.cy >= r.top && g.cy <= r.bottom + 12){ an = {n:i, fx:(g.cx - r.left)/r.width, fy:(g.cy - r.top)/r.height}; break; }
+    }
+    zoom = nz; zoomLbl.textContent = Math.round(zoom*100)+"%";
     pages.forEach(p => p?.task?.cancel?.());
-    layout(); pages[cur]?.el.scrollIntoView({block:"start"});
+    layout();
+    if (an){
+      const r = pages[an.n].el.getBoundingClientRect();
+      wrap.scrollLeft += r.left + an.fx*r.width - g.cx;
+      window.scrollBy(0, r.top + an.fy*r.height - g.cy);
+    }
   }
+  current.pinch = {
+    start(g){ if (mode !== "pages") return; const r = wrap.getBoundingClientRect();
+      wrap.style.transformOrigin = `${g.cx - r.left}px ${g.cy - r.top}px`; },
+    move(r){ if (mode !== "pages") return; wrap.style.transform = `scale(${clamp(zoom*r, MINZ, MAXZ)/zoom})`; },
+    end(r, g){ wrap.style.transform = ""; if (mode === "pages" && Math.abs(r - 1) > 0.02) setZoom(zoom*r, g); }
+  };
 
   /* text positions per page (used by search and reader mode) */
   const pageData = [];
@@ -610,6 +683,11 @@ VIEWERS.sheet = async (file) => {
   const p = wb.Props || {}; Object.assign(current.info, {"Author":p.Author, "Last saved by":p.LastAuthor, "Created": p.CreatedDate ? new Date(p.CreatedDate).toLocaleString() : ""});
 
   const wrapBox = h("div",{class:"sheetwrap"});
+  let sfs = 13;
+  current.pinch = livePinch(() => wrapBox.querySelector("table"), r => {
+    sfs = clamp(sfs*r, 7, 32);
+    const t = wrapBox.querySelector("table"); if (t) t.style.fontSize = sfs+"px";
+  });
   const tabs = h("div",{class:"tabs"});
   let active = 0, rows = [], limit = 500, filterQ = "", wrapText = false, headerRow = false;
   const info = h("span",{class:"tlabel"});
@@ -631,7 +709,7 @@ VIEWERS.sheet = async (file) => {
     let list = body.map((r,i) => [i+offset, r]);
     if (q) list = list.filter(([,r]) => r.some(c => String(c).toLowerCase().includes(q)));
     info.textContent = `${body.length.toLocaleString()} rows × ${ncol} cols` + (q ? ` · ${list.length} match` : "");
-    const tbl = h("table",{class:"sh"+(wrapText?" wrap":"")});
+    const tbl = h("table",{class:"sh"+(wrapText?" wrap":"")}); tbl.style.fontSize = sfs+"px";
     const thr = h("tr",{}, h("th",{class:"rn"}, ""));
     for (let c = 0; c < ncol; c++) thr.append(h("th",{}, headerRow ? String(rows[0]?.[c] ?? "") || colName(c) : colName(c)));
     tbl.append(h("thead",{}, thr));
@@ -675,7 +753,8 @@ function readingTools(paper, extra=[]){
   const apply = () => paper.style.fontSize = (15*fontScale)+"px";
   apply();
   const [sInp, sLbl] = searchBox(() => paper);
-  toolbar(tbtn("A−", ()=>{ fontScale = Math.max(.7, fontScale-.1); apply(); }), tbtn("A+", ()=>{ fontScale = Math.min(2.2, fontScale+.1); apply(); }), sep(), ...extra, sInp, sLbl);
+  toolbar(tbtn("A−", ()=>{ fontScale = Math.max(.6, fontScale-.1); apply(); }), tbtn("A+", ()=>{ fontScale = Math.min(3, fontScale+.1); apply(); }), sep(), ...extra, sInp, sLbl);
+  current.pinch = livePinch(paper, r => { fontScale = clamp(fontScale*r, .6, 3); apply(); });
 }
 VIEWERS.doc = async (file) => {
   await need("mammoth","purify");
@@ -849,6 +928,7 @@ VIEWERS.slides = async (file) => {
   }
   if (!slidePaths.length){ view.innerHTML = ""; view.append(h("div",{class:"center"},"No slides found.")); return; }
   const nb = tbtn("Speaker notes", () => { notesOn = !notesOn; nb.classList.toggle("on", notesOn); notesEls.forEach(n => n.classList.toggle("hidden", !notesOn)); });
+  current.pinch = livePinch(container, r => { container.style.maxWidth = clamp(container.offsetWidth*r, 300, 6000)+"px"; });
   const sz2 = [tbtn("Smaller", ()=>{ container.style.maxWidth = Math.max(320, container.offsetWidth*0.8)+"px"; }), tbtn("Larger", ()=>{ container.style.maxWidth = (container.offsetWidth*1.25)+"px"; })];
   const [sInp, sLbl] = searchBox(() => container);
   toolbar(h("span",{class:"tlabel"}, `${slidePaths.length} slides`), sep(), notesEls.length ? nb : null, ...sz2, sep(), sInp, sLbl);
@@ -861,16 +941,28 @@ VIEWERS.image = async (file) => {
   const wrap = h("div",{class:"imgwrap"}, img);
   await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error("This image format isn't supported by your browser.")); });
   current.info["Dimensions"] = `${img.naturalWidth} × ${img.naturalHeight} px`;
-  let rot = 0, scale = 1, full = false;
-  const apply = () => { img.style.transform = `rotate(${rot}deg) scale(${scale})`; };
+  let rot = 0, scale = 1;
   const z = h("span",{class:"tlabel"}, "100%");
-  toolbar(tbtn("−", ()=>{ scale = Math.max(.2, scale/1.25); z.textContent = Math.round(scale*100)+"%"; apply(); }), z,
-          tbtn("+", ()=>{ scale = Math.min(8, scale*1.25); z.textContent = Math.round(scale*100)+"%"; apply(); }),
-          tbtn("Fit", ()=>{ scale = 1; full = false; wrap.classList.remove("full"); z.textContent = "100%"; apply(); }),
-          tbtn("1:1", ()=>{ full = !full; wrap.classList.toggle("full", full); }), sep(),
-          tbtn("Rotate ↻", ()=>{ rot = (rot+90)%360; apply(); }),
+  const fitW = () => Math.min(img.naturalWidth, Math.max(100, (view.clientWidth || window.innerWidth) - 28));
+  function setScale(v, g){
+    const old = img.getBoundingClientRect();
+    scale = clamp(v, .2, 12);
+    img.style.width = (fitW()*scale) + "px";
+    img.style.transform = `rotate(${rot}deg)`;
+    z.textContent = Math.round(scale*100)+"%";
+    if (g && old.width){ // keep the pinched spot under the fingers
+      const fx = (g.cx - old.left)/old.width, fy = (g.cy - old.top)/old.height, n = img.getBoundingClientRect();
+      wrap.scrollLeft += n.left + fx*n.width - g.cx; wrap.scrollTop += n.top + fy*n.height - g.cy;
+    }
+  }
+  toolbar(tbtn("−", ()=>setScale(scale/1.25)), z, tbtn("+", ()=>setScale(scale*1.25)),
+          tbtn("Fit", ()=>setScale(1)), tbtn("1:1", ()=>setScale(img.naturalWidth/fitW())), sep(),
+          tbtn("Rotate ↻", ()=>{ rot = (rot+90)%360; img.style.transform = `rotate(${rot}deg)`; }),
           h("span",{class:"tlabel"}, `${img.naturalWidth}×${img.naturalHeight}`));
+  wrap.style.height = "calc(100vh - 110px)";
+  current.pinch = livePinch(img, (r, g) => setScale(scale*r, g));
   view.innerHTML = ""; view.append(wrap);
+  setScale(1);
 };
 
 /* Audio / Video */
@@ -915,6 +1007,7 @@ VIEWERS.code = async (file) => {
   toolbar(prettyBtn, wrapBtn, lnBtn, tbtn("A−", ()=>{ fs=Math.max(9,fs-1); pre.style.fontSize=fs+"px"; }), tbtn("A+", ()=>{ fs=Math.min(24,fs+1); pre.style.fontSize=fs+"px"; }), copyBtn, sep(), sInp, sLbl,
           h("span",{class:"tlabel"}, `${lineCount.toLocaleString()} lines${truncated ? " (truncated)" : ""}`));
   draw();
+  current.pinch = livePinch(pre, r => { fs = clamp(fs*r, 8, 40); pre.style.fontSize = fs+"px"; });
   view.innerHTML = ""; view.append(h("div",{class:"codewrap"}, pre));
 };
 

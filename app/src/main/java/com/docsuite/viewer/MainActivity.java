@@ -56,9 +56,11 @@ public class MainActivity extends AppCompatActivity {
         s.setDomStorageEnabled(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
-        s.setSupportZoom(true);
-        s.setBuiltInZoomControls(true);
+        // Zooming is handled inside the page (document only), never the whole app
+        s.setSupportZoom(false);
+        s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
+        s.setTextZoom(100);
         s.setMediaPlaybackRequiresUserGesture(true);
 
         // Serves the bundled app from assets/ and files opened from other apps from cache/shared/
