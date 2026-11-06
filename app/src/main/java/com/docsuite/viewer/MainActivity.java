@@ -9,6 +9,9 @@ import android.provider.OpenableColumns;
 import android.content.ClipData;
 import android.util.Base64;
 import android.webkit.JavascriptInterface;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -16,6 +19,7 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import androidx.activity.OnBackPressedCallback;
@@ -42,6 +46,9 @@ public class MainActivity extends AppCompatActivity {
     private ValueCallback<Uri[]> fileCallback;
     private ActivityResultLauncher<Intent> picker;
     private boolean pageReady = false;
+    private View fullscreenView;
+    private WebChromeClient.CustomViewCallback fullscreenCb;
+    private int savedOrientation;
     private String pendingJs = null;
     private File sharedDir;
 
@@ -113,6 +120,36 @@ public class MainActivity extends AppCompatActivity {
         });
 
         web.setWebChromeClient(new WebChromeClient() {
+            // HTML5 fullscreen (e.g. the video player's fullscreen button)
+            @Override
+            public void onShowCustomView(View customView, CustomViewCallback callback) {
+                if (fullscreenView != null) { callback.onCustomViewHidden(); return; }
+                fullscreenView = customView;
+                fullscreenCb = callback;
+                savedOrientation = getRequestedOrientation();
+                web.setVisibility(View.GONE);
+                FrameLayout decor = (FrameLayout) getWindow().getDecorView();
+                decor.addView(customView, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                customView.setBackgroundColor(0xFF000000);
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                hideSystemBars(true);
+                setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR);
+            }
+
+            @Override
+            public void onHideCustomView() {
+                if (fullscreenView == null) return;
+                FrameLayout decor = (FrameLayout) getWindow().getDecorView();
+                decor.removeView(fullscreenView);
+                fullscreenView = null;
+                web.setVisibility(View.VISIBLE);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                hideSystemBars(false);
+                setRequestedOrientation(savedOrientation);
+                if (fullscreenCb != null) { fullscreenCb.onCustomViewHidden(); fullscreenCb = null; }
+            }
+
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
@@ -134,6 +171,7 @@ public class MainActivity extends AppCompatActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
+                if (fullscreenView != null) { web.getWebChromeClient().onHideCustomView(); return; }
                 web.evaluateJavascript("window.docsuiteBack ? window.docsuiteBack() : false", value -> {
                     if (!"true".equals(value)) {
                         setEnabled(false);
@@ -147,6 +185,20 @@ public class MainActivity extends AppCompatActivity {
         web.addJavascriptInterface(new ShareBridge(), "DocSuiteAndroid");
         web.loadUrl(START_URL);
         if (savedInstanceState == null) handleIntent(getIntent());
+    }
+
+    private void hideSystemBars(boolean hide) {
+        View d = getWindow().getDecorView();
+        if (hide) {
+            d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        } else {
+            d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
     }
 
     @Override
