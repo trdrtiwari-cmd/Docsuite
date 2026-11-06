@@ -197,6 +197,7 @@ const LIB = {
   jszip: [[...L("jszip.min.js"), CDN+"jszip/3.10.1/jszip.min.js", JSD+"jszip@3.10.1/dist/jszip.min.js"]],
   marked: [[...L("marked.min.js"), CDN+"marked/12.0.2/marked.min.js", JSD+"marked@12.0.2/marked.min.js", CDN+"marked/4.3.0/marked.min.js"]],
   purify: [[...L("purify.min.js"), CDN+"dompurify/3.1.6/purify.min.js", JSD+"dompurify@3.1.6/dist/purify.min.js"]],
+  jspdf: [[...L("jspdf.umd.min.js"), CDN+"jspdf/2.5.1/jspdf.umd.min.js", JSD+"jspdf@2.5.1/dist/jspdf.umd.min.js"]],
 };
 const loaded = {};
 function loadOne(src){
@@ -390,6 +391,12 @@ function showShare(){
   if (current.sharePage) opts.push(h("button",{class:"sopt", onclick:async ()=>{ bg.remove();
       try { const {blob, name} = await current.sharePage(); shareBlob(blob, name); } catch { toast("Couldn't create the page image"); } }},
     h("span",{style:"font-size:22px"},"🖼️"), h("span",{}, "Share current page as image", h("small",{}, "PNG of the page you're viewing"))));
+  if (current.removePw) opts.push(h("button",{class:"sopt", onclick:async ()=>{ bg.remove();
+      const lbl = h("small",{}, "Preparing…"); const card = h("div",{class:"sheet-card"}, h("h3",{style:"margin:0 0 6px"},"Removing password"), h("div",{class:"sopt"}, h("span",{class:"spin",style:"width:22px;height:22px;margin:0"}), h("span",{}, "Rebuilding unlocked PDF", lbl)));
+      const wait = h("div",{class:"sheet-bg"}, card); document.body.append(wait);
+      try { const {blob, name} = await current.removePw((n,t)=>{ lbl.textContent = `Page ${n} of ${t}`; }); wait.remove(); shareBlob(blob, name); }
+      catch { wait.remove(); toast("Couldn't remove the password"); } }},
+    h("span",{style:"font-size:22px"},"🔓"), h("span",{}, "Save unlocked copy (no password)", h("small",{}, "A copy that opens without the password"))));
   if (opts.length === 1){ shareBlob(f, f.name); return; }
   const bg = h("div",{class:"sheet-bg", onclick:e=>{ if(e.target===bg) bg.remove(); }},
     h("div",{class:"sheet-card"}, h("h3",{style:"margin:0 0 6px"},"Share"), ...opts));
@@ -487,19 +494,28 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const VIEWERS = {};
 
 /* PDF */
-function askPassword(name, wrong){
+// Remembered PDF passwords, stored only in this browser/app.
+const pwKey = f => "ds_pw_" + f.name + "_" + f.size;
+function loadPw(f){ try { return localStorage.getItem(pwKey(f)); } catch { return null; } }
+function savePw(f, pw){ try { localStorage.setItem(pwKey(f), pw); } catch {} }
+function forgetPw(f){ try { localStorage.removeItem(pwKey(f)); } catch {} }
+function askPassword(name, wrong, remembered){
   return new Promise(resolve => {
     const inp = h("input",{class:"tinput", type:"password", autocomplete:"off", placeholder:"Password",
       style:"width:100%;font-size:16px;padding:12px;margin:14px 0 8px"});
     const show = h("label",{style:"display:flex;gap:8px;align-items:center;font-size:14px;color:var(--muted);justify-content:center"},
       h("input",{type:"checkbox", onchange:e => inp.type = e.target.checked ? "text" : "password"}), "Show password");
+    const remember = h("input",{type:"checkbox", checked: remembered ? true : false});
     const done = v => { resolve(v); };
-    const form = h("form",{class:"err", onsubmit:e => { e.preventDefault(); if (inp.value) done(inp.value); }},
+    const submit = () => { if (inp.value) done({pw: inp.value, remember: remember.checked}); };
+    const form = h("form",{class:"err", onsubmit:e => { e.preventDefault(); submit(); }},
       h("div",{style:"font-size:34px"},"🔒"),
       h("h3",{}, "Password required"),
       h("p",{style:"color:var(--muted);margin:0;word-break:break-word"}, `${name} is protected. Enter its password to open it.`),
       wrong ? h("p",{style:"color:#ef4444;margin:10px 0 0;font-weight:600"}, "Wrong password, try again.") : null,
       inp, show,
+      h("label",{style:"display:flex;gap:8px;align-items:center;font-size:14px;color:var(--muted);justify-content:center;margin-top:8px"},
+        remember, "Remember password on this device"),
       h("div",{style:"display:flex;gap:10px;justify-content:center;margin-top:16px"},
         h("button",{type:"button", class:"tbtn", style:"padding:10px 18px", onclick:()=>done(null)}, "Cancel"),
         h("button",{type:"submit", class:"pbtn"}, "Open")),
@@ -513,12 +529,20 @@ VIEWERS.pdf = async (file) => {
   if (!globalThis.pdfjsWorker && window["pdfjs-dist/build/pdf.worker"]) globalThis.pdfjsWorker = window["pdfjs-dist/build/pdf.worker"];
   const lib = window.pdfjsLib || window["pdfjs-dist/build/pdf"];
   const data = new Uint8Array(await file.arrayBuffer());
-  let pdf;
+  let pdf, pwUsed = null;
+  const saved = loadPw(file);
   const task = lib.getDocument({data, isEvalSupported:false});
   // Password-protected PDFs: ask for the password (and again if it was wrong)
   task.onPassword = (update, reason) => {
-    askPassword(file.name, reason === (lib.PasswordResponses?.INCORRECT_PASSWORD ?? 2))
-      .then(pw => pw == null ? task.destroy() : update(pw));
+    const wrong = reason === (lib.PasswordResponses?.INCORRECT_PASSWORD ?? 2);
+    if (!wrong && saved){ pwUsed = saved; update(saved); return; } // try the remembered one first
+    if (wrong && saved) forgetPw(file); // remembered one was wrong, drop it
+    askPassword(file.name, wrong, false).then(res => {
+      if (res == null){ task.destroy(); return; }
+      pwUsed = res.pw;
+      if (res.remember) savePw(file, res.pw); else forgetPw(file);
+      update(res.pw);
+    });
   };
   try {
     pdf = await task.promise;
@@ -613,6 +637,30 @@ VIEWERS.pdf = async (file) => {
     const blob = await new Promise(r => c.toBlob(r, "image/png"));
     return {blob, name: current.file.name.replace(/\.pdf$/i, "") + `-page-${n}.png`};
   };
+  if (pwUsed != null){
+    // Build an unlocked copy by rendering each page and writing a new, password-free PDF.
+    current.removePw = async (onProgress) => {
+      await need("jspdf");
+      const JsPDF = (window.jspdf || window).jsPDF;
+      let doc = null;
+      for (let n = 1; n <= pdf.numPages; n++){
+        const page = await pdf.getPage(n);
+        const v1 = page.getViewport({scale:1});
+        const sc = Math.min(2, 2200 / Math.max(v1.width, v1.height));
+        const vp = page.getViewport({scale: sc});
+        const c = document.createElement("canvas"); c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+        const ctx = c.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0,0,c.width,c.height);
+        await page.render({canvasContext: ctx, viewport: vp}).promise;
+        const img = c.toDataURL("image/jpeg", 0.85);
+        const orient = v1.width > v1.height ? "l" : "p";
+        if (!doc) doc = new JsPDF({orientation:orient, unit:"pt", format:[v1.width, v1.height]});
+        else doc.addPage([v1.width, v1.height], orient);
+        doc.addImage(img, "JPEG", 0, 0, v1.width, v1.height);
+        onProgress?.(n, pdf.numPages);
+      }
+      return {blob: doc.output("blob"), name: current.file.name.replace(/\.pdf$/i, "") + "-unlocked.pdf"};
+    };
+  }
   current.pinch = {
     start(g){ if (mode !== "pages") return; const r = wrap.getBoundingClientRect();
       wrap.style.transformOrigin = `${g.cx - r.left}px ${g.cy - r.top}px`; },

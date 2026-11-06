@@ -28,7 +28,7 @@ jobs:
           set -e
           L="$GITHUB_WORKSPACE/app/src/main/assets/lib"
           mkdir -p "$L" /tmp/libs && cd /tmp/libs
-          npm pack pdfjs-dist@3.11.174 xlsx@0.18.5 mammoth@1.6.0 jszip@3.10.1 marked@12.0.2 dompurify@3.1.6
+          npm pack pdfjs-dist@3.11.174 xlsx@0.18.5 mammoth@1.6.0 jszip@3.10.1 marked@12.0.2 dompurify@3.1.6 jspdf@2.5.1
           for f in *.tgz; do d="${f%.tgz}"; mkdir -p "$d"; tar xzf "$f" -C "$d"; done
           pick() { p=$(find "$1" -path "*/$2" | head -1); [ -n "$p" ] || { echo "Missing $2 in $1"; exit 1; }; cp "$p" "$L/$3"; echo "bundled $3 <- $p"; }
           pick pdfjs-dist-3.11.174 build/pdf.min.js        pdf.min.js
@@ -37,6 +37,7 @@ jobs:
           pick mammoth-1.6.0      mammoth.browser.min.js   mammoth.browser.min.js
           pick jszip-3.10.1       dist/jszip.min.js        jszip.min.js
           pick dompurify-3.1.6    dist/purify.min.js       purify.min.js
+          pick jspdf-2.5.1        dist/jspdf.umd.min.js    jspdf.umd.min.js
           if find marked-12.0.2 -path "*/package/marked.min.js" | grep -q .; then
             pick marked-12.0.2 package/marked.min.js marked.min.js
           else
