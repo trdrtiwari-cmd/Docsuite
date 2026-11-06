@@ -487,18 +487,46 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const VIEWERS = {};
 
 /* PDF */
+function askPassword(name, wrong){
+  return new Promise(resolve => {
+    const inp = h("input",{class:"tinput", type:"password", autocomplete:"off", placeholder:"Password",
+      style:"width:100%;font-size:16px;padding:12px;margin:14px 0 8px"});
+    const show = h("label",{style:"display:flex;gap:8px;align-items:center;font-size:14px;color:var(--muted);justify-content:center"},
+      h("input",{type:"checkbox", onchange:e => inp.type = e.target.checked ? "text" : "password"}), "Show password");
+    const done = v => { resolve(v); };
+    const form = h("form",{class:"err", onsubmit:e => { e.preventDefault(); if (inp.value) done(inp.value); }},
+      h("div",{style:"font-size:34px"},"🔒"),
+      h("h3",{}, "Password required"),
+      h("p",{style:"color:var(--muted);margin:0;word-break:break-word"}, `${name} is protected. Enter its password to open it.`),
+      wrong ? h("p",{style:"color:#ef4444;margin:10px 0 0;font-weight:600"}, "Wrong password, try again.") : null,
+      inp, show,
+      h("div",{style:"display:flex;gap:10px;justify-content:center;margin-top:16px"},
+        h("button",{type:"button", class:"tbtn", style:"padding:10px 18px", onclick:()=>done(null)}, "Cancel"),
+        h("button",{type:"submit", class:"pbtn"}, "Open")),
+      h("p",{style:"color:var(--muted);font-size:12px;margin:14px 0 0"}, "Bank and card statements usually use a password made from your name and date of birth; check the email or SMS that came with the file."));
+    view.innerHTML = ""; view.append(form);
+    setTimeout(() => inp.focus(), 50);
+  });
+}
 VIEWERS.pdf = async (file) => {
   await need("pdf");
   if (!globalThis.pdfjsWorker && window["pdfjs-dist/build/pdf.worker"]) globalThis.pdfjsWorker = window["pdfjs-dist/build/pdf.worker"];
   const lib = window.pdfjsLib || window["pdfjs-dist/build/pdf"];
   const data = new Uint8Array(await file.arrayBuffer());
   let pdf;
+  const task = lib.getDocument({data, isEvalSupported:false});
+  // Password-protected PDFs: ask for the password (and again if it was wrong)
+  task.onPassword = (update, reason) => {
+    askPassword(file.name, reason === (lib.PasswordResponses?.INCORRECT_PASSWORD ?? 2))
+      .then(pw => pw == null ? task.destroy() : update(pw));
+  };
   try {
-    pdf = await lib.getDocument({data, isEvalSupported:false}).promise;
+    pdf = await task.promise;
   } catch (e){
-    if (e?.name === "PasswordException") throw new Error("This PDF is password-protected.");
+    if (e?.name === "PasswordException" || task.destroyed) throw new Error("This PDF is password-protected. Open it again and enter the password to view it.");
     throw e;
   }
+  view.innerHTML = `<div class="center"><div><div class="spin"></div>Opening ${esc(file.name)}…</div></div>`;
   cleanup.push(() => pdf.destroy());
   current.info["Pages"] = pdf.numPages;
   try { const md = await pdf.getMetadata(); const i = md.info||{};
