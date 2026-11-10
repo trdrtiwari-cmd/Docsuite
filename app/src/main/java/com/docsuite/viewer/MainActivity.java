@@ -5,6 +5,9 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
 import android.provider.OpenableColumns;
 import android.content.ClipData;
 import android.util.Base64;
@@ -34,6 +37,8 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.Locale;
+import java.util.Set;
 import java.io.OutputStream;
 import java.io.IOException;
 
@@ -51,6 +56,8 @@ public class MainActivity extends AppCompatActivity {
     private int savedOrientation;
     private String pendingJs = null;
     private File sharedDir;
+    private TextToSpeech tts;
+    private volatile boolean ttsReady = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -183,6 +190,8 @@ public class MainActivity extends AppCompatActivity {
         });
 
         web.addJavascriptInterface(new ShareBridge(), "DocSuiteAndroid");
+        web.addJavascriptInterface(new TtsBridge(), "DocSuiteTTS");
+        initTts();
         web.loadUrl(START_URL);
         if (savedInstanceState == null) handleIntent(getIntent());
     }
@@ -320,6 +329,71 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void initTts() {
+        tts = new TextToSpeech(this, status -> {
+            ttsReady = status == TextToSpeech.SUCCESS;
+            if (ttsReady) {
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String id) { }
+                    @Override public void onDone(String id) { fireTtsEnd(id); }
+                    @Override public void onError(String id) { fireTtsEnd(id); }
+                });
+            }
+        });
+    }
+
+    private void fireTtsEnd(String id) {
+        runOnUiThread(() -> web.evaluateJavascript(
+                "window.__ttsEnd && window.__ttsEnd('" + id + "')", null));
+    }
+
+    // Picks an installed voice for the given language and gender; falls back to pitch.
+    private Voice pickVoice(String lang, String gender) {
+        if (tts == null) return null;
+        Set<Voice> voices;
+        try { voices = tts.getVoices(); } catch (Exception e) { return null; }
+        if (voices == null) return null;
+        String want = "male".equals(gender) ? "male" : "female";
+        String other = "male".equals(gender) ? "female" : "male";
+        Voice best = null;
+        for (Voice v : voices) {
+            if (v.getLocale() == null || !lang.equals(v.getLocale().getLanguage())) continue;
+            String name = v.getName() == null ? "" : v.getName().toLowerCase(Locale.ROOT);
+            boolean net = v.isNetworkConnectionRequired();
+            if (name.contains(want)) {
+                if (!net) return v;      // prefer offline voice
+                if (best == null) best = v;
+            } else if (!name.contains(other) && best == null) {
+                best = v;
+            }
+        }
+        return best;
+    }
+
+    /** Lets the page drive the device text-to-speech engine. */
+    private class TtsBridge {
+        @JavascriptInterface
+        public String available() { return ttsReady ? "true" : "false"; }
+
+        @JavascriptInterface
+        public void speak(String id, String text, float rate, String gender) {
+            if (!ttsReady || text == null) return;
+            boolean hindi = text.matches("(?s).*[\\u0900-\\u097F].*");
+            Locale loc = hindi ? new Locale("hi", "IN") : Locale.ENGLISH;
+            try {
+                tts.setLanguage(loc);
+                Voice v = pickVoice(loc.getLanguage(), gender);
+                if (v != null) { tts.setVoice(v); tts.setPitch(1.0f); }
+                else tts.setPitch("male".equals(gender) ? 0.85f : 1.15f);
+                tts.setSpeechRate(rate <= 0 ? 1f : rate);
+                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, id);
+            } catch (Exception ignored) { }
+        }
+
+        @JavascriptInterface
+        public void stop() { if (tts != null) try { tts.stop(); } catch (Exception ignored) { } }
+    }
+
     private String displayName(Uri uri) {
         String name = null;
         if ("content".equals(uri.getScheme())) {
@@ -334,6 +408,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        if (tts != null) { try { tts.stop(); tts.shutdown(); } catch (Exception ignored) { } }
         if (web != null) web.destroy();
         super.onDestroy();
     }

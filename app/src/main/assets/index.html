@@ -147,6 +147,11 @@ pre.code.wrap{white-space:pre-wrap;word-break:break-word}
 .kv dt{color:var(--muted)} .kv dd{margin:0;word-break:break-word}
 .sopt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:12px 14px;margin-top:8px;font-weight:600}
 .sopt small{display:block;font-weight:400;color:var(--muted)}
+.readbar{position:fixed;left:0;right:0;bottom:0;z-index:45;display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--panel);border-top:1px solid var(--line);box-shadow:0 -2px 12px rgba(0,0,0,.14)}
+.readbar .grow{flex:1;min-width:0;font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rbtn{border:1px solid var(--line);background:var(--panel);border-radius:9px;padding:7px 11px;font-size:13px;font-weight:600;white-space:nowrap;flex:none}
+.rbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+::highlight(tts){background:#fde047;color:#111}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 16px;border-radius:10px;font-size:14px;z-index:60;box-shadow:var(--shadow)}
 </style>
 </head>
@@ -310,7 +315,7 @@ $("#infoBtn").onclick = showInfo;
 $("#shareBtn").onclick = showShare;
 window.addEventListener("keydown", e => { if (e.key === "Escape") { const s = $(".sheet-bg"); if (s) s.remove(); } });
 
-function teardown(){ cleanup.forEach(fn => { try{fn()}catch{} }); cleanup = []; tools.innerHTML = ""; tools.classList.add("hidden"); view.innerHTML = ""; }
+function teardown(){ try { window.__ttsStop?.(); } catch {} cleanup.forEach(fn => { try{fn()}catch{} }); cleanup = []; tools.innerHTML = ""; tools.classList.add("hidden"); view.innerHTML = ""; }
 function goBack(){
   stack.pop();
   if (stack.length){ const prev = stack.pop(); openFile(prev.file, false, prev.extra); }
@@ -500,6 +505,102 @@ async function toggleFullscreen(el){
     else { await (el.requestFullscreen || el.webkitRequestFullscreen).call(el); }
   } catch { toast("Fullscreen isn't available here"); }
 }
+
+/* ---------- read aloud (text-to-speech) ---------- */
+// Splits text into sentences (handles the Hindi danda too).
+function splitPlain(text){
+  const out = []; const re = /[^.!?।\n]+[.!?।]+["'’”)\]]*\s*|[^.!?।\n]+\n+|[^.!?।\n]+$/g;
+  let m; while ((m = re.exec(text)) && out.length < 8000){ const t = m[0].trim(); if (t) out.push(t); }
+  return out;
+}
+// Non-destructive sentence ranges for highlighting, mapped onto a DOM element's text nodes.
+function sentencesFromEl(el){
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const nodes = []; let full = "";
+  while (walker.nextNode()){ const n = walker.currentNode; if (!n.nodeValue) continue; nodes.push({node:n, start:full.length}); full += n.nodeValue; }
+  if (!full.trim()) return [];
+  const locate = off => { for (let i = nodes.length-1; i >= 0; i--){ if (off >= nodes[i].start){ const len = nodes[i].node.nodeValue.length; return {node:nodes[i].node, offset: Math.min(off - nodes[i].start, len)}; } } return {node:nodes[0].node, offset:0}; };
+  const out = []; const re = /[^.!?।\n]+[.!?।]+["'’”)\]]*\s*|[^.!?।\n]+\n+|[^.!?।\n]+$/g;
+  let m; while ((m = re.exec(full)) && out.length < 8000){
+    const t = m[0]; if (!t.trim()) continue;
+    const a = locate(m.index), b = locate(m.index + t.replace(/\s+$/,"").length);
+    let r = null; try { r = document.createRange(); r.setStart(a.node, a.offset); r.setEnd(b.node, b.offset); } catch { r = null; }
+    out.push({text: t.trim(), range: r});
+  }
+  return out;
+}
+function selectionText(root){
+  const s = window.getSelection(); if (!s || s.isCollapsed) return "";
+  if (root && s.anchorNode && !root.contains(s.anchorNode)) return "";
+  return s.toString();
+}
+const Speech = (() => {
+  let sents = [], ranges = null, i = 0, playing = false, paused = false, rate = 1, gender = "female", curId = 0;
+  let bar = null, playBtn = null, genderBtn = null, speedBtn = null, statusEl = null;
+  const nativeTTS = () => { try { return !!window.DocSuiteTTS && DocSuiteTTS.available() !== "false"; } catch { return !!window.DocSuiteTTS; } };
+  function ensureHL(){ try { if (window.CSS && CSS.highlights && !CSS.highlights.get("tts")) CSS.highlights.set("tts", new Highlight()); } catch {} }
+  function clearHL(){ try { CSS.highlights?.get("tts")?.clear(); } catch {} }
+  function pickVoice(){
+    const vs = (window.speechSynthesis ? speechSynthesis.getVoices() : []) || [];
+    if (!vs.length) return null;
+    const hi = /[ऀ-ॿ]/.test(sents[i] || "");
+    let pool = vs.filter(v => hi ? /^hi/i.test(v.lang) : /^en/i.test(v.lang));
+    if (!pool.length) pool = vs;
+    const female = /female|woman|zira|samantha|victoria|karen|moira|tessa|fiona|salli|joanna|google.*female/i;
+    const male = /\bmale\b|\bman\b|david|daniel|alex|fred|rishi|matthew|google.*male/i;
+    const want = gender === "female" ? female : male, avoid = gender === "female" ? male : female;
+    return pool.find(v => want.test(v.name)) || pool.find(v => !avoid.test(v.name)) || pool[0];
+  }
+  function scrollTo(r){ try { const rc = r.getBoundingClientRect(); if (rc.height || rc.width) window.scrollTo({top: Math.max(0, window.scrollY + rc.top - 170), behavior:"smooth"}); } catch {} }
+  function speakCur(){
+    if (i >= sents.length){ stop(); return; }
+    if (statusEl) statusEl.textContent = `Reading  ${i+1} / ${sents.length}`;
+    clearHL(); if (ranges && ranges[i]){ try { CSS.highlights?.get("tts")?.add(ranges[i]); } catch {} scrollTo(ranges[i]); }
+    const text = sents[i];
+    if (nativeTTS()){
+      curId++; try { DocSuiteTTS.speak(String(curId), text, rate, gender); } catch { setTimeout(() => { if (playing && !paused) next(); }, 400); }
+    } else if (window.speechSynthesis){
+      const u = new SpeechSynthesisUtterance(text); u.rate = rate;
+      const v = pickVoice(); if (v) u.voice = v; else u.pitch = gender === "female" ? 1.3 : 0.75;
+      u.onend = () => { if (playing && !paused) next(); };
+      u.onerror = () => { if (playing && !paused) next(); };
+      try { speechSynthesis.cancel(); } catch {}
+      speechSynthesis.speak(u);
+    } else { toast("Text-to-speech isn't available here"); stop(); }
+  }
+  function next(){ i++; speakCur(); }
+  window.__ttsEnd = id => { if (nativeTTS() && playing && !paused && String(curId) === String(id)) next(); };
+  function setPlayUI(){ if (!playBtn) return; const p = playing && !paused; playBtn.textContent = p ? "⏸ Pause" : "▶ Resume"; playBtn.classList.toggle("on", p); }
+  function stopEngine(){ try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch {} if (nativeTTS()){ try { DocSuiteTTS.stop(); } catch {} } }
+  function restart(){ if (playing && !paused){ stopEngine(); speakCur(); } }
+  function pause(){ paused = true; stopEngine(); setPlayUI(); }
+  function resume(){ if (!sents.length) return; paused = false; playing = true; speakCur(); setPlayUI(); }
+  function stop(){ playing = false; paused = false; stopEngine(); clearHL(); bar?.remove(); bar = null; }
+  window.__ttsStop = stop;
+  function showBar(){
+    if (bar){ setPlayUI(); return; }
+    bar = h("div",{class:"readbar"},
+      playBtn = h("button",{class:"rbtn on", onclick:() => (playing && !paused) ? pause() : resume()}, "⏸ Pause"),
+      h("button",{class:"rbtn", onclick:stop}, "⏹ Stop"),
+      genderBtn = h("button",{class:"rbtn", onclick:() => { gender = gender === "female" ? "male" : "female"; genderBtn.textContent = gender === "female" ? "♀ Female" : "♂ Male"; restart(); }}, gender === "female" ? "♀ Female" : "♂ Male"),
+      speedBtn = h("button",{class:"rbtn", onclick:() => { const r = [0.75,1,1.25,1.5,2]; rate = r[(r.indexOf(rate)+1) % r.length] || 1; speedBtn.textContent = rate+"×"; restart(); }}, rate+"×"),
+      statusEl = h("div",{class:"grow"}, ""),
+      h("button",{class:"rbtn", onclick:stop, "aria-label":"Close"}, "✕"));
+    document.body.append(bar); setPlayUI();
+  }
+  function play(list, rlist){ ensureHL(); sents = list; ranges = rlist || null; i = 0; playing = true; paused = false; showBar(); speakCur(); }
+  async function readFrom(getText, getContainer){
+    const container = getContainer ? getContainer() : null;
+    const sel = selectionText(container || view);
+    if (sel && sel.trim().length > 1){ const parts = splitPlain(sel); if (parts.length){ play(parts, null); return; } }
+    if (container){ const ss = sentencesFromEl(container); if (ss.length){ play(ss.map(x => x.text), ss.map(x => x.range)); return; } }
+    const t = await getText(); const parts = splitPlain(t || "");
+    if (!parts.length){ toast("No text to read aloud"); return; }
+    play(parts, null);
+  }
+  return { readFrom, stop };
+})();
+const readBtn = (getText, getContainer) => tbtn("🔊 Read", () => Speech.readFrom(getText, getContainer));
 
 /* ---------- viewers ---------- */
 const VIEWERS = {};
@@ -808,7 +909,18 @@ VIEWERS.pdf = async (file) => {
   const prevBtn = tbtn("▲", () => go(mIdx - 1));
   const nextBtn = tbtn("▼", () => go(mIdx + 1));
   prevBtn.setAttribute("aria-label","Previous match"); nextBtn.setAttribute("aria-label","Next match");
-  toolbar(sInp, prevBtn, nextBtn, sLbl, sep(), ...modeBtns, sep(), pageLbl, goInp, sep(), ...zoomGroup);
+  async function pdfText(){
+    let out = "";
+    for (let n = 1; n <= pdf.numPages; n++){
+      const {items} = await getPageData(n);
+      const sorted = [...items].sort((a,b) => (b.y - a.y) || (a.x - b.x));
+      let py = null;
+      for (const it of sorted){ if (py !== null && Math.abs(py - it.y) > it.h*0.8) out += "\n"; out += it.str + " "; py = it.y; }
+      out += "\n";
+    }
+    return out;
+  }
+  toolbar(sInp, prevBtn, nextBtn, sLbl, sep(), ...modeBtns, sep(), readBtn(pdfText, () => mode === "text" ? readerEl : null), sep(), pageLbl, goInp, sep(), ...zoomGroup);
 
   view.innerHTML = ""; view.append(wrap); layout();
   let rt; const onResize = () => { clearTimeout(rt); rt = setTimeout(() => { if (mode==="pages") setZoom(zoom); }, 300); };
@@ -902,7 +1014,8 @@ function readingTools(paper, extra=[]){
   const apply = () => paper.style.fontSize = (15*fontScale)+"px";
   apply();
   const [sInp, sLbl] = searchBox(() => paper);
-  toolbar(tbtn("A−", ()=>{ fontScale = Math.max(.6, fontScale-.1); apply(); }), tbtn("A+", ()=>{ fontScale = Math.min(3, fontScale+.1); apply(); }), sep(), ...extra, sInp, sLbl);
+  toolbar(readBtn(() => paper.textContent, () => paper), sep(),
+          tbtn("A−", ()=>{ fontScale = Math.max(.6, fontScale-.1); apply(); }), tbtn("A+", ()=>{ fontScale = Math.min(3, fontScale+.1); apply(); }), sep(), ...extra, sInp, sLbl);
   current.pinch = livePinch(paper, r => { fontScale = clamp(fontScale*r, .6, 3); apply(); });
 }
 VIEWERS.doc = async (file) => {
@@ -1170,7 +1283,7 @@ VIEWERS.code = async (file) => {
   let fs = 13;
   const [sInp, sLbl] = searchBox(() => pre);
   const copyBtn = tbtn("Copy", async () => { try { await navigator.clipboard.writeText(src); toast("Copied"); } catch { toast("Copy isn't allowed here"); } });
-  toolbar(prettyBtn, wrapBtn, lnBtn, tbtn("A−", ()=>{ fs=Math.max(9,fs-1); pre.style.fontSize=fs+"px"; }), tbtn("A+", ()=>{ fs=Math.min(24,fs+1); pre.style.fontSize=fs+"px"; }), copyBtn, sep(), sInp, sLbl,
+  toolbar(readBtn(() => src, () => pre), prettyBtn, wrapBtn, lnBtn, tbtn("A−", ()=>{ fs=Math.max(9,fs-1); pre.style.fontSize=fs+"px"; }), tbtn("A+", ()=>{ fs=Math.min(24,fs+1); pre.style.fontSize=fs+"px"; }), copyBtn, sep(), sInp, sLbl,
           h("span",{class:"tlabel"}, `${lineCount.toLocaleString()} lines${truncated ? " (truncated)" : ""}`));
   draw();
   current.pinch = livePinch(pre, r => { fs = clamp(fs*r, 8, 40); pre.style.fontSize = fs+"px"; });
